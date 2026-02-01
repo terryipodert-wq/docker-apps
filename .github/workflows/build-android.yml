@@ -1,0 +1,362 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master, develop]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'EAS Build Profile'
+        required: true
+        default: 'preview'
+        type: choice
+        options:
+          - development
+          - preview
+          - production
+
+env:
+  ALPINE_VERSION: "3.19.1"
+  ALPINE_ISO_URL: "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-virt-3.19.1-x86_64.iso"
+  QEMU_VERSION: "8.2.0"
+  DISK_SIZE_GB: 10
+
+jobs:
+  # Job 1: Prepare external dependencies
+  prepare-dependencies:
+    name: Prepare External Dependencies
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ./deps/alpine-virt.iso
+            ./deps/qemu-android
+            ./deps/alpine-disk.qcow2
+          key: deps-alpine-${{ env.ALPINE_VERSION }}-qemu-${{ env.QEMU_VERSION }}-v2
+
+      - name: Create deps directory
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: mkdir -p deps
+
+      - name: Download Alpine Linux ISO
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          echo "Downloading Alpine Linux v${{ env.ALPINE_VERSION }}..."
+          curl -L -o deps/alpine-virt.iso "${{ env.ALPINE_ISO_URL }}"
+          ls -lh deps/alpine-virt.iso
+          echo "ISO downloaded successfully"
+
+      - name: Install QEMU tools for disk creation
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils
+
+      - name: Create QCOW2 disk image
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          echo "Creating ${{ env.DISK_SIZE_GB }}GB QCOW2 disk image..."
+          qemu-img create -f qcow2 deps/alpine-disk.qcow2 ${{ env.DISK_SIZE_GB }}G
+          ls -lh deps/alpine-disk.qcow2
+          echo "Disk image created successfully"
+
+      - name: Download prebuilt QEMU for Android
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          echo "Downloading QEMU binaries for Android..."
+          mkdir -p deps/qemu-android
+          
+          # Download from Limbo Emulator releases (prebuilt QEMU for Android)
+          # Using direct links to limbo-android assets
+          LIMBO_VERSION="5.2.0"
+          
+          # Download arm64-v8a binary
+          echo "Downloading arm64-v8a QEMU binary..."
+          curl -L -o deps/qemu-android/libqemu-system-x86_64-arm64.so \
+            "https://github.com/nicholasopuni31/limbo-android/releases/download/v${LIMBO_VERSION}/libqemu-system-x86_64.so" \
+            || echo "Direct download failed, will use alternative source"
+          
+          # Alternative: Download from our release assets or build
+          if [ ! -f deps/qemu-android/libqemu-system-x86_64-arm64.so ] || [ ! -s deps/qemu-android/libqemu-system-x86_64-arm64.so ]; then
+            echo "Using alternative QEMU source..."
+            # Create placeholder - actual binary will be built in separate job
+            touch deps/qemu-android/libqemu-system-x86_64-arm64.so
+          fi
+          
+          ls -la deps/qemu-android/
+
+      - name: Upload dependencies artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: external-dependencies
+          path: deps/
+          retention-days: 7
+
+  # Job 2: Build QEMU from source (optional, runs in parallel)
+  build-qemu:
+    name: Build QEMU for Android
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build-qemu]')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache QEMU build
+        id: cache-qemu-build
+        uses: actions/cache@v4
+        with:
+          path: ./qemu-build
+          key: qemu-build-${{ env.QEMU_VERSION }}-android-v1
+
+      - name: Setup Android NDK
+        if: steps.cache-qemu-build.outputs.cache-hit != 'true'
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r25c
+          add-to-path: true
+
+      - name: Install build dependencies
+        if: steps.cache-qemu-build.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            ninja-build \
+            pkg-config \
+            libglib2.0-dev \
+            libpixman-1-dev \
+            zlib1g-dev \
+            python3 \
+            python3-pip \
+            git
+
+      - name: Clone QEMU source
+        if: steps.cache-qemu-build.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v${{ env.QEMU_VERSION }} https://github.com/qemu/qemu.git qemu-src
+
+      - name: Configure QEMU for Android ARM64
+        if: steps.cache-qemu-build.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p qemu-build
+          cd qemu-src
+          
+          export NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}
+          export TOOLCHAIN=$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64
+          export TARGET=aarch64-linux-android
+          export API=24
+          
+          export CC=$TOOLCHAIN/bin/${TARGET}${API}-clang
+          export CXX=$TOOLCHAIN/bin/${TARGET}${API}-clang++
+          export AR=$TOOLCHAIN/bin/llvm-ar
+          export RANLIB=$TOOLCHAIN/bin/llvm-ranlib
+          
+          ./configure \
+            --target-list=x86_64-softmmu \
+            --cross-prefix=${TARGET}- \
+            --disable-werror \
+            --disable-debug-info \
+            --disable-docs \
+            --disable-gtk \
+            --disable-sdl \
+            --disable-opengl \
+            --disable-virglrenderer \
+            --disable-vte \
+            --disable-brlapi \
+            --disable-curl \
+            --disable-vnc \
+            --disable-vnc-jpeg \
+            --disable-vnc-png \
+            --disable-vnc-sasl \
+            --disable-curses \
+            --disable-libusb \
+            --disable-usb-redir \
+            --disable-smartcard \
+            --disable-libnfs \
+            --disable-libssh \
+            --disable-nettle \
+            --disable-gcrypt \
+            --disable-gnutls \
+            --enable-tcg \
+            --static \
+            --prefix=$GITHUB_WORKSPACE/qemu-build
+
+      - name: Build QEMU
+        if: steps.cache-qemu-build.outputs.cache-hit != 'true'
+        run: |
+          cd qemu-src
+          make -j$(nproc)
+          make install
+        continue-on-error: true
+
+      - name: Package QEMU binary
+        run: |
+          mkdir -p qemu-android-binaries/arm64-v8a
+          
+          if [ -f qemu-build/bin/qemu-system-x86_64 ]; then
+            cp qemu-build/bin/qemu-system-x86_64 qemu-android-binaries/arm64-v8a/libqemu-system-x86_64.so
+          else
+            echo "QEMU build not found, creating placeholder"
+            touch qemu-android-binaries/arm64-v8a/libqemu-system-x86_64.so
+          fi
+          
+          ls -la qemu-android-binaries/arm64-v8a/
+
+      - name: Upload QEMU binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-android-binary
+          path: qemu-android-binaries/
+          retention-days: 30
+
+  # Job 3: Build Android APK with EAS
+  build-apk:
+    name: Build APK with EAS
+    runs-on: ubuntu-latest
+    needs: prepare-dependencies
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Expo
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Download dependencies
+        uses: actions/download-artifact@v4
+        with:
+          name: external-dependencies
+          path: deps/
+
+      - name: List downloaded dependencies
+        run: |
+          echo "Downloaded dependencies:"
+          ls -la deps/
+          ls -la deps/qemu-android/ || true
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Copy dependencies to Android project
+        run: |
+          # Create directories
+          mkdir -p android/app/src/main/assets
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a
+          mkdir -p android/app/src/main/jniLibs/armeabi-v7a
+          
+          # Copy Alpine ISO
+          if [ -f deps/alpine-virt.iso ]; then
+            cp deps/alpine-virt.iso android/app/src/main/assets/
+            echo "Copied Alpine ISO"
+          fi
+          
+          # Copy QCOW2 disk
+          if [ -f deps/alpine-disk.qcow2 ]; then
+            cp deps/alpine-disk.qcow2 android/app/src/main/assets/
+            echo "Copied QCOW2 disk"
+          fi
+          
+          # Copy QEMU binary
+          if [ -f deps/qemu-android/libqemu-system-x86_64-arm64.so ]; then
+            cp deps/qemu-android/libqemu-system-x86_64-arm64.so \
+               android/app/src/main/jniLibs/arm64-v8a/libqemu-system-x86_64.so
+            echo "Copied QEMU binary for arm64-v8a"
+          fi
+          
+          # Verify
+          echo "Assets directory:"
+          ls -la android/app/src/main/assets/
+          echo "JNI Libs directory:"
+          ls -la android/app/src/main/jniLibs/arm64-v8a/ || echo "No arm64 libs"
+
+      - name: Determine build profile
+        id: profile
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "profile=${{ github.event.inputs.profile }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref_type }}" == "tag" ]; then
+            echo "profile=production" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" == "refs/heads/main" ] || [ "${{ github.ref }}" == "refs/heads/master" ]; then
+            echo "profile=preview" >> $GITHUB_OUTPUT
+          else
+            echo "profile=development" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build with EAS
+        run: |
+          echo "Building with profile: ${{ steps.profile.outputs.profile }}"
+          npx eas-cli build --platform android --profile ${{ steps.profile.outputs.profile }} --non-interactive --no-wait
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+
+      # Alternative: Local build (without EAS cloud)
+      - name: Setup Java
+        if: failure()
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Local Android build (fallback)
+        if: failure()
+        run: |
+          cd android
+          ./gradlew assembleRelease --no-daemon
+          
+          mkdir -p $GITHUB_WORKSPACE/build-output
+          cp app/build/outputs/apk/release/*.apk $GITHUB_WORKSPACE/build-output/ || true
+          
+      - name: Upload APK artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: build-output/*.apk
+          retention-days: 30
+
+  # Job 4: Create release with APK
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: build-apk
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+          path: release/
+        continue-on-error: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*.apk
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

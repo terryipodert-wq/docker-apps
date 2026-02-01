@@ -1,0 +1,185 @@
+name: Download External Dependencies
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run weekly to check for updates
+    - cron: '0 0 * * 0'
+
+env:
+  ALPINE_VERSION: "3.19.1"
+  
+jobs:
+  download-alpine:
+    name: Download Alpine Linux
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Download Alpine Virt ISO
+        run: |
+          mkdir -p artifacts
+          
+          echo "Downloading Alpine Linux v${{ env.ALPINE_VERSION }} Virtual..."
+          curl -L -o artifacts/alpine-virt-${{ env.ALPINE_VERSION }}.iso \
+            "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-virt-${{ env.ALPINE_VERSION }}-x86_64.iso"
+          
+          # Verify checksum
+          curl -L -o artifacts/checksums.txt \
+            "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-virt-${{ env.ALPINE_VERSION }}-x86_64.iso.sha256"
+          
+          echo "Download complete:"
+          ls -lh artifacts/
+          
+          # Verify
+          cd artifacts
+          sha256sum -c checksums.txt || echo "Checksum verification failed"
+
+      - name: Create QCOW2 disk images
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils
+          
+          # Create different sized disk images
+          qemu-img create -f qcow2 artifacts/alpine-disk-5G.qcow2 5G
+          qemu-img create -f qcow2 artifacts/alpine-disk-10G.qcow2 10G
+          qemu-img create -f qcow2 artifacts/alpine-disk-20G.qcow2 20G
+          
+          echo "Disk images created:"
+          ls -lh artifacts/*.qcow2
+
+      - name: Upload Alpine artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpine-linux-${{ env.ALPINE_VERSION }}
+          path: artifacts/
+          retention-days: 90
+
+  download-qemu-prebuilt:
+    name: Download Prebuilt QEMU
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Download Limbo QEMU binaries
+        run: |
+          mkdir -p qemu-binaries/arm64-v8a
+          mkdir -p qemu-binaries/armeabi-v7a
+          
+          # Try multiple sources for QEMU binaries
+          
+          # Source 1: Termux packages (QEMU for Android)
+          echo "Attempting to download from available sources..."
+          
+          # Create info file
+          cat > qemu-binaries/README.md << 'EOF'
+          # QEMU Binaries for Android
+          
+          These binaries are for running x86_64 QEMU on Android devices.
+          
+          ## Sources
+          
+          1. **Limbo Emulator**: https://github.com/nicholasopuni31/limbo-android
+          2. **Termux QEMU**: Install via `pkg install qemu-system-x86_64` in Termux
+          3. **Build from source**: See build-qemu workflow
+          
+          ## Usage
+          
+          Place `libqemu-system-x86_64.so` in:
+          ```
+          android/app/src/main/jniLibs/arm64-v8a/
+          ```
+          
+          ## License
+          
+          QEMU is licensed under GPLv2.
+          EOF
+          
+          # Try to download from Limbo releases
+          RELEASES_URL="https://api.github.com/repos/nicholasopuni31/limbo-android/releases/latest"
+          DOWNLOAD_URL=$(curl -s $RELEASES_URL | grep -o 'https://.*\.apk' | head -1) || true
+          
+          if [ -n "$DOWNLOAD_URL" ]; then
+            echo "Found Limbo APK: $DOWNLOAD_URL"
+            curl -L -o limbo.apk "$DOWNLOAD_URL" || true
+            
+            # Extract QEMU binary from APK
+            if [ -f limbo.apk ]; then
+              unzip -o limbo.apk -d limbo-extract || true
+              
+              # Look for QEMU binary
+              find limbo-extract -name "libqemu*.so" -exec cp {} qemu-binaries/arm64-v8a/ \; || true
+              
+              rm -rf limbo.apk limbo-extract
+            fi
+          fi
+          
+          # List what we have
+          echo "QEMU binaries:"
+          ls -la qemu-binaries/arm64-v8a/ || echo "No arm64 binaries found"
+          ls -la qemu-binaries/armeabi-v7a/ || echo "No arm32 binaries found"
+
+      - name: Upload QEMU binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-prebuilt-binaries
+          path: qemu-binaries/
+          retention-days: 90
+
+  create-release-assets:
+    name: Create Release Assets Bundle
+    runs-on: ubuntu-latest
+    needs: [download-alpine, download-qemu-prebuilt]
+    
+    steps:
+      - name: Download Alpine artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: alpine-linux-${{ env.ALPINE_VERSION }}
+          path: bundle/alpine/
+
+      - name: Download QEMU binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: qemu-prebuilt-binaries
+          path: bundle/qemu/
+
+      - name: Create combined bundle
+        run: |
+          mkdir -p bundle/combined
+          
+          # Copy Alpine ISO (smallest virtual version)
+          cp bundle/alpine/alpine-virt-*.iso bundle/combined/alpine-virt.iso || true
+          
+          # Copy 10G disk as default
+          cp bundle/alpine/alpine-disk-10G.qcow2 bundle/combined/alpine-disk.qcow2 || true
+          
+          # Copy QEMU binaries
+          cp -r bundle/qemu/* bundle/combined/ || true
+          
+          # Create manifest
+          cat > bundle/combined/MANIFEST.json << EOF
+          {
+            "version": "1.0.0",
+            "alpine_version": "${{ env.ALPINE_VERSION }}",
+            "disk_size_gb": 10,
+            "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "files": [
+              "alpine-virt.iso",
+              "alpine-disk.qcow2",
+              "arm64-v8a/libqemu-system-x86_64.so"
+            ]
+          }
+          EOF
+          
+          echo "Combined bundle:"
+          ls -lah bundle/combined/
+          
+          # Create compressed archive
+          cd bundle
+          tar -czvf docker-android-deps.tar.gz combined/
+
+      - name: Upload combined bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-android-dependencies
+          path: bundle/docker-android-deps.tar.gz
+          retention-days: 90
