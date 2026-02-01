@@ -1,4 +1,4 @@
-package com.dockerandroid.qemu;
+package com.dockerandroid.app.qemu;
 
 import android.app.Notification;
 import android.app.NotificationChannel;

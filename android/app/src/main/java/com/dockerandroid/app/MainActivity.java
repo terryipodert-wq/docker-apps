@@ -1,4 +1,4 @@
-package com.dockerandroid;
+package com.dockerandroid.app;
 
 import com.facebook.react.ReactActivity;
 import com.facebook.react.ReactActivityDelegate;

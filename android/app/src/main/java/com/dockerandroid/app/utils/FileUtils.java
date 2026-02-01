@@ -1,4 +1,4 @@
-package com.dockerandroid.utils;
+package com.dockerandroid.app.utils;
 
 import android.content.Context;
 import android.util.Log;

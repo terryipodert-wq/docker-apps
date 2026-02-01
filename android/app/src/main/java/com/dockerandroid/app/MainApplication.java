@@ -1,4 +1,4 @@
-package com.dockerandroid;
+package com.dockerandroid.app;
 
 import android.app.Application;
 
@@ -10,7 +10,7 @@ import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint;
 import com.facebook.react.defaults.DefaultReactNativeHost;
 import com.facebook.soloader.SoLoader;
 
-import com.dockerandroid.qemu.QemuPackage;
+import com.dockerandroid.app.qemu.QemuPackage;
 
 import java.util.List;
 
