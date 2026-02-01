@@ -9,7 +9,6 @@ def reactNativeArchitectures() {
 
 android {
     ndkVersion rootProject.ext.ndkVersion
-    buildToolsVersion rootProject.ext.buildToolsVersion
     compileSdk rootProject.ext.compileSdkVersion
 
     namespace "com.dockerandroid"
@@ -34,6 +33,7 @@ android {
                 abiFilters(*reactNativeArchitectures())
             }
         }
+        manifestPlaceholders = [largeHeap: "true"]
     }
     
     // Enable JNI
@@ -59,7 +59,7 @@ android {
         release {
             signingConfig signingConfigs.debug
             minifyEnabled false
-            proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
         }
     }
     
@@ -79,10 +79,6 @@ android {
         }
     }
     
-    // Large heap for QEMU
-    defaultConfig {
-        manifestPlaceholders = [largeHeap: "true"]
-    }
 }
 
 dependencies {
@@ -103,5 +99,3 @@ dependencies {
     }
 }
 
-apply from: file("../../node_modules/@react-native-community/cli-platform-android/native_modules.gradle")
-applyNativeModulesAppBuildGradle(project)
